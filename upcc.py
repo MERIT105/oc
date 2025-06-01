@@ -4,7 +4,6 @@ import secrets
 import asyncio
 import nest_asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     ContextTypes, Defaults
@@ -44,6 +43,12 @@ MONEY_BANK = "\U0001F3E6"
 BLUE_CIRCLE = "\U0001F535"
 ORANGE_CIRCLE = "\U0001F7E0"
 
+def escape_markdown_v2(text):
+    escape_chars = r"_*[]()~`>#+-=|{}.!\\"
+    for c in escape_chars:
+        text = text.replace(c, f"\\{c}")
+    return text
+
 # Env
 ADMIN_ID = os.getenv("ADMIN_ID")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -61,7 +66,6 @@ if not BOT_TOKEN or not ADMIN_ID or not GROUP_CHAT_ID:
     exit(1)
 
 def card_brand_type(cc):
-    """Detect card type & emoji by number (returns: emoji_name, plain_name)"""
     cc = str(cc)
     if cc.startswith("4"):
         return EMOJIS['visa'], "VISA"
@@ -84,7 +88,7 @@ def card_brand_type(cc):
 class TelegramCCCheckerBot:
     def __init__(self):
         self.is_logged_in = set()
-        self.pending_auth = {}  # user_id: card_str
+        self.pending_auth = {}
 
     def is_authorized_group(self, chat_id):
         return str(chat_id) == str(GROUP_CHAT_ID)
@@ -123,7 +127,6 @@ class TelegramCCCheckerBot:
         bin6 = str(bin6)[:6]
         while len(bin6) < 6:
             bin6 += "0"
-        # Guess length: use 15 if AMEX(34,37), else 16
         length = 15 if bin6.startswith(("34", "37")) else 16
         cc_list = list(map(int, bin6))
         while len(cc_list) < (length - 1):
@@ -151,7 +154,7 @@ class TelegramCCCheckerBot:
                 total += dd
         return (10 - (total % 10)) % 10
 
-    # /gen command: real, random, no username, batch or single, BIN support
+    # NEW: /gen sends each cc in a separate message (box), with brand+emoji, no username.
     async def gen(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_authorized_group(update.effective_chat.id):
             await update.message.reply_text(f"{CROSSMARK} Access denied. Please use this bot only in the authorized group.")
@@ -162,10 +165,8 @@ class TelegramCCCheckerBot:
         bin_mode = False
         bin_given = ""
 
-        # Parse for: /gen, /gen 5, /gen <bin>, /gen <bin> 5
         if args:
             if len(args) == 1 and args[0].isdigit():
-                # Could be count or BIN depending on length
                 if 6 <= len(args[0]) <= 8:
                     bin_mode = True
                     bin_given = args[0]
@@ -181,32 +182,58 @@ class TelegramCCCheckerBot:
         else:
             cards = [self.random_bin_cc(bin_given) for _ in range(count)]
 
-        # Output: mono, one per line, no username
-        response = "\n".join(f"`{card}`" for card in cards)
-        msg = await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
-        asyncio.create_task(self.autodel_message(context, msg, 300))
+        for card in cards:
+            ccn = card.split("|")[0]
+            emoji, brand = card_brand_type(ccn)
+            response = f"`{escape_markdown_v2(card)}` | {emoji}"
+            msg = await update.message.reply_text(response, parse_mode="MarkdownV2")
+            asyncio.create_task(self.autodel_message(context, msg, 300))
 
-    # /chk command for single or batch checking with BIN info  
+    # /chk for single card
     async def chk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_authorized_group(update.effective_chat.id):
             await update.message.reply_text(f"{CROSSMARK} Access denied. Please use this bot only in the authorized group.")
             return
-        # Correct username: prefer @username if available (with possible underscores)
         if update.effective_user.username:
-            username = f"@{update.effective_user.username}"
+            username = escape_markdown_v2(f"@{update.effective_user.username}")
         else:
-            username = update.effective_user.first_name
+            username = escape_markdown_v2(update.effective_user.first_name)
 
-        # Multi-line handler: grab all lines after "/chk"
-        full_text = update.message.text
-        lines = [line.strip() for line in full_text.split('\n') if line.strip() and not line.strip().startswith('/chk')]
-        if not lines:
-            await update.message.reply_text(f"{WARNING} Usage: /chk cc|mm|yy|cvv or /chk (then paste multiple lines)")
+        args = context.args
+        if not args or len(args) != 1:
+            await update.message.reply_text(f"{WARNING} Usage: /chk cc|mm|yy|cvv", parse_mode="MarkdownV2")
+            return
+        card_str = args[0].strip()
+        card_data = card_str.split("|")
+        if len(card_data) != 4:
+            await update.message.reply_text(f"{CROSSMARK} Invalid card format: '{escape_markdown_v2(card_str)}' (must be cc|mm|yy|cvv)", parse_mode="MarkdownV2")
             return
 
+        res, emoji, _ = await self.full_auth_check(card_str, get_brand=True)
+        txt = (
+            f"`{escape_markdown_v2(card_str)}` | {emoji}\n"
+            f"{escape_markdown_v2(res)}\n"
+            f"Checked by: {username}"
+        )
+        msg = await update.message.reply_text(txt, parse_mode="MarkdownV2")
+        asyncio.create_task(self.autodel_message(context, msg, 300))
+
+    # /mchk for batch cards (up to 20), blank lines between blocks
+    async def mchk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.is_authorized_group(update.effective_chat.id):
+            await update.message.reply_text(f"{CROSSMARK} Access denied. Please use this bot only in the authorized group.")
+            return
+        if update.effective_user.username:
+            username = escape_markdown_v2(f"@{update.effective_user.username}")
+        else:
+            username = escape_markdown_v2(update.effective_user.first_name)
+
+        full_text = update.message.text
+        lines = [line.strip() for line in full_text.split('\n') if line.strip() and not line.strip().startswith('/mchk')]
         valid_cards = [line for line in lines if len(line.split('|')) == 4]
+
         if not valid_cards:
-            await update.message.reply_text(f"{CROSSMARK} No valid cards found in your input!")
+            await update.message.reply_text(f"{WARNING} Paste up to 20 cc|mm|yy|cvv, each on a new line after /mchk", parse_mode="MarkdownV2")
             return
 
         valid_cards = valid_cards[:20]
@@ -215,17 +242,16 @@ class TelegramCCCheckerBot:
 
         result_lines = []
         for cidx, card_str in enumerate(valid_cards):
-            res, emoji, name = await self.full_auth_check(card_str, get_brand=True)
+            res, emoji, _ = await self.full_auth_check(card_str, get_brand=True)
             report = (
-                f"`{card_str}` | {emoji}\n"
-                f"{res}\n"
+                f"`{escape_markdown_v2(card_str)}` | {emoji}\n"
+                f"{escape_markdown_v2(res)}\n"
                 f"Checked by: {username}"
             )
             result_lines.append(report)
-        # Add a blank line between each checked CC
         final_response = (f"{bin_info_msg}\n" if bin_info_msg else "") + "\n\n".join(result_lines)
         final_response = final_response[:4000]
-        msg = await update.message.reply_text(final_response, parse_mode=ParseMode.MARKDOWN)
+        msg = await update.message.reply_text(final_response, parse_mode="MarkdownV2")
         asyncio.create_task(self.autodel_message(context, msg, 300))
 
     async def get_bin_info_message(self, bin_number):
@@ -242,10 +268,10 @@ class TelegramCCCheckerBot:
                     country = d.get("country", {}).get("name", "")
                     emoji_flag = d.get("country", {}).get("emoji", "")
                     return (
-                        f"𝗕𝗜𝗡 ⇾ `{bin_number}`\n"
-                        f"𝗜𝗻𝗳𝗼: {brand} - {typex} - {category}\n"
-                        f"𝗕𝗮𝗻𝗸: {bankn}\n"
-                        f"𝗖𝗼𝘂𝗻𝘁𝗿𝘆: {country} {emoji_flag}\n"
+                        f"𝗕𝗜𝗡 ⇾ `{escape_markdown_v2(bin_number)}`\n"
+                        f"𝗜𝗻𝗳𝗼: {escape_markdown_v2(brand)} - {escape_markdown_v2(typex)} - {escape_markdown_v2(str(category))}\n"
+                        f"𝗕𝗮𝗻𝗸: {escape_markdown_v2(str(bankn))}\n"
+                        f"𝗖𝗼𝘂𝗻𝘁𝗿𝘆: {escape_markdown_v2(str(country))} {escape_markdown_v2(str(emoji_flag))}\n"
                     )
                 else:
                     return ""
@@ -253,7 +279,6 @@ class TelegramCCCheckerBot:
             logger.debug(f"BIN info fetch failed: {e}")
             return ""
 
-    # /auth command with button for all auth checks
     async def auth(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_authorized_group(update.effective_chat.id):
             await update.message.reply_text(f"{CROSSMARK} Access denied. Please use this bot only in the authorized group.")
@@ -277,7 +302,6 @@ class TelegramCCCheckerBot:
             reply_markup=reply_markup
         )
 
-    # Button callback
     async def button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         user_id = query.from_user.id
@@ -288,14 +312,13 @@ class TelegramCCCheckerBot:
                 await query.edit_message_text(f"{CROSSMARK} No card found for this session. Please use /auth again.")
                 return
             results, cc_brand_emoji, cc_brand_name = await self.full_auth_check(card_str, get_brand=True)
-            # Correct username for "Checked by"
             if query.from_user.username:
-                username = f"@{query.from_user.username}"
+                username = escape_markdown_v2(f"@{query.from_user.username}")
             else:
-                username = query.from_user.first_name
+                username = escape_markdown_v2(query.from_user.first_name)
             footer = f"\nChecked by: {username}\n{'-'*31}"
-            response = f"*{STAR} All Auth Results for Card {card_str.split('|')[0][-4:]} | {cc_brand_emoji}*\n{results}{footer}"
-            await query.edit_message_text(response, parse_mode=ParseMode.MARKDOWN)
+            response = f"*{STAR} All Auth Results for Card {escape_markdown_v2(card_str.split('|')[0][-4:])} | {cc_brand_emoji}*\n{escape_markdown_v2(results)}{footer}"
+            await query.edit_message_text(response, parse_mode="MarkdownV2")
             del self.pending_auth[user_id]
 
     async def full_auth_check(self, card_str, get_brand=False):
@@ -344,7 +367,6 @@ class TelegramCCCheckerBot:
         result, msg = self.mock_bank_auth(cc)
         return f"{MONEY_BANK} [Bank] Card {cc[-4:]}: {result} - {msg}"
 
-    # Mock auth logic
     def mock_basic_auth(self, cc):
         try:
             return ("APPROVED", "Basic auth passed") if int(cc[-1]) % 2 == 0 else ("DECLINED", "Basic auth declined")
@@ -387,22 +409,25 @@ class TelegramCCCheckerBot:
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"{STAR} *CC Checker Bot Help*\n"
-            f"/gen - Generate random real CC\n"
-            f"/gen N - Generate N random\n"
+            f"/gen - Generate random real CC (separate box for each)\n"
+            f"/gen N - Generate N random (N messages)\n"
             f"/gen <bin> - Generate for that BIN\n"
             f"/gen <bin> N - Generate N for that BIN\n"
-            f"/chk <cc|mm|yy|cvv> or /chk\n<cc1>\n<cc2>... - Check card(s) (shows type/emoji and BIN info)\n"
+            f"/chk <cc|mm|yy|cvv> - Check a single card (shows type/emoji)\n"
+            f"/mchk (cc|mm|yy|cvv lines) - Multi check (up to 20, blocks separated)\n"
             f"/auth <cc|mm|yy|cvv> - Button for all checks\n"
-            f"All responses auto-delete in 5 minutes."
+            f"All responses auto-delete in 5 minutes.",
+            parse_mode="MarkdownV2"
         )
 
 async def main():
-    defaults = Defaults(parse_mode=ParseMode.MARKDOWN)
+    defaults = Defaults(parse_mode="MarkdownV2")
     bot = TelegramCCCheckerBot()
     application = ApplicationBuilder().token(BOT_TOKEN).defaults(defaults).build()
 
     application.add_handler(CommandHandler("gen", bot.gen))
     application.add_handler(CommandHandler("chk", bot.chk))
+    application.add_handler(CommandHandler("mchk", bot.mchk))
     application.add_handler(CommandHandler("auth", bot.auth))
     application.add_handler(CallbackQueryHandler(bot.button))
     application.add_handler(CommandHandler("help", bot.help))

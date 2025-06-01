@@ -4,7 +4,7 @@
 # source venv/bin/activate
 
 # Set your required environment variables here
-export BOT_TOKEN="7390661510:AAFgK-54qaOy31XPzNxb_MNn8gam_fWH38E"
+export BOT_TOKEN="7390661510:AAHaypDV6VlIuflE5BmzBxzRArwYzGSw8rw"
 export ADMIN_ID="5712886230" 
 export GROUP_CHAT_ID="-1002433536975"
 
